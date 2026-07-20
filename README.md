@@ -64,7 +64,6 @@ func main() {
 - 部分读取 (hyperslabs)
 - 虚拟数据集
 - 对象/区域引用
-- 写入文件
 
 ## 使用示例
 
@@ -262,6 +261,245 @@ if errors.Is(err, hdf5.ErrNotFound) {
 | `ReadScalarString() (string, error)` | 读取标量字符串 |
 | `ReadCompound() ([]map[string]interface{}, error)` | 读取复合类型 |
 | `ReadScalarCompound() (map[string]interface{}, error)` | 读取标量复合类型 |
+
+## HDF5 文件 8 字节对齐规则
+
+HDF5 文件格式要求多个部分遵循 8 字节对齐规则，这是保证跨平台兼容性和高效内存访问的重要设计。
+
+### 对齐规则汇总
+
+| 组件 | 对齐要求 | 代码位置 |
+|------|---------|---------|
+| **全局堆对象 (Global Heap)** | 对象数据和整个堆集合都填充到 8 字节边界 | [internal/heap/global.go](file:///d:/code/go-hdf5/internal/heap/global.go#L104-L106), [internal/heap/global_write.go](file:///d:/code/go-hdf5/internal/heap/global_write.go#L57-L67) |
+| **属性消息 V1 (Attribute V1)** | 名称、数据类型、数据空间后面都填充到 8 字节边界 | [internal/message/attribute.go](file:///d:/code/go-hdf5/internal/message/attribute.go#L66-L98) |
+| **属性消息 V2/V3** | 无 8 字节对齐要求 | [internal/message/attribute_write.go](file:///d:/code/go-hdf5/internal/message/attribute_write.go) |
+| **数据类型名称 (Datatype V1/V2)** | 复合类型成员名称后面填充到 8 字节边界 | [internal/message/datatype.go](file:///d:/code/go-hdf5/internal/message/datatype.go#L294) |
+| **对象头部分配** | 使用 8 字节对齐分配 | [internal/alloc/allocator.go](file:///d:/code/go-hdf5/internal/alloc/allocator.go#L107-L119) |
+| **二进制读写器** | 提供 `Align(8)` 和 `WritePadding(8)` 方法 | [internal/binary/reader.go](file:///d:/code/go-hdf5/internal/binary/reader.go#L217), [internal/binary/writer.go](file:///d:/code/go-hdf5/internal/binary/writer.go#L176) |
+
+### 对齐计算方式
+
+对齐填充字节数的计算公式为：
+```go
+padding := (8 - (size % 8)) % 8
+```
+
+其中 `size` 是当前数据的字节长度。如果 `size` 已经是 8 的倍数，则 `padding` 为 0。
+
+### 全局堆对象对齐示例
+
+```go
+// 对象数据写入后，计算填充
+dataSize := len(obj)
+padding := (8 - (dataSize % 8)) % 8
+if padding > 0 {
+    w.WriteBytes(make([]byte, padding)) // 写入零字节填充
+}
+```
+
+### 属性 V1 对齐示例
+
+属性 V1 格式在每个主要部分后都需要对齐：
+
+```
+[版本(1)] [标志(1)] [名称大小(2)] [类型大小(2)] [空间大小(2)]
+[名称...] [填充到8字节]
+[数据类型...] [填充到8字节]
+[数据空间...] [填充到8字节]
+[属性数据...]
+```
+
+---
+
+## HDF5 文件写入流程
+
+写入 HDF5 文件遵循以下步骤：
+
+### 文件创建阶段
+
+```
+1. os.Create(path)                    创建操作系统文件
+        ↓
+2. binary.NewWriter(osFile, cfg)      创建二进制写入器
+        ↓
+3. superblock.NewSuperblock()         创建 Superblock (V2)
+        ↓
+4. 计算 root group 地址 = superblock 大小
+        ↓
+5. object.NewEmptyGroupHeader()       创建空 root group header
+        ↓
+6. 计算 EOF 地址 = superblock + header 大小
+        ↓
+7. sb.Write(writer)                   写入 Superblock
+        ↓
+8. object.WriteHeader(...)            写入 root group header
+        ↓
+9. alloc.New(eofAddr)                 创建空间分配器
+        ↓
+10. 返回 File 对象
+```
+
+### 组创建阶段 (`CreateGroup`)
+
+```
+1. object.NewEmptyGroupHeader()       创建空组消息 (LinkInfo + GroupInfo)
+        ↓
+2. object.HeaderSize(...)             计算 header 大小
+        ↓
+3. allocator.Alloc(...)               分配空间
+        ↓
+4. object.WriteHeader(...)            写入组 header
+        ↓
+5. message.NewHardLink(name, addr)    创建硬链接
+        ↓
+6. parent.addLink(link)               添加到父组
+        ↓
+7. 返回 Group 对象
+```
+
+### 数据集创建阶段 (`CreateDataset`)
+
+```
+1. inferDimensionsAndType(data)       推断维度和元素类型
+        ↓
+2. dtype.GoTypeToDatatype(elemType)   创建 HDF5 数据类型
+        ↓
+3. message.NewDataspace(dims)        创建数据空间
+        ↓
+4. dtype.Encode(datatype, data)       编码数据为字节
+        ↓
+5. 确定存储布局 (连续或分块)
+        ├─ 连续: 分配空间 → 写入数据 → NewContiguousLayout
+        └─ 分块: 切分数据 → 写入块 → NewChunkedLayout
+        ↓
+6. object.NewDatasetHeader(...)       创建数据集消息
+        ↓
+7. allocator.Alloc(...)               分配 header 空间
+        ↓
+8. object.WriteHeader(...)            写入数据集 header
+        ↓
+9. parent.addLink(link)               创建硬链接到父组
+        ↓
+10. 返回 Dataset 对象
+```
+
+### 刷新阶段 (`Flush`)
+
+```
+1. 更新 superblock.EOFAddress         设置当前 EOF
+        ↓
+2. writer.At(0)                       定位到文件开头
+        ↓
+3. sb.Write(writer)                   重写 Superblock
+        ↓
+4. file.Sync()                        同步到磁盘
+```
+
+---
+
+## HDF5 文件读取流程
+
+读取 HDF5 文件遵循以下步骤：
+
+### 文件打开阶段
+
+```
+1. os.Open(path)                      打开操作系统文件
+        ↓
+2. superblock.Read(file)              搜索并读取 Superblock
+   ├─ 在偏移位置 0, 512, 1024, 2048 搜索签名
+   ├─ 根据版本选择 readV0/V1/V2/V3
+   └─ 返回 Superblock 结构
+        ↓
+3. binary.NewReader(file, cfg)        创建二进制读取器
+   ├─ 使用 Superblock 的配置
+   ├─ 字节序: LittleEndian
+   ├─ OffsetSize: 2/4/8 字节
+   └─ LengthSize: 2/4/8 字节
+        ↓
+4. openGroupAt(rootAddr, "/")         加载 root group
+        ↓
+5. 返回 File 对象
+```
+
+### 对象读取阶段 (`object.Read`)
+
+```
+1. reader.At(address)                 定位到对象地址
+        ↓
+2. Peek(4) 检查签名
+   ├─ "OHDR" → readV2()               V2 对象头
+   └─ 版本字节 1 → readV1()            V1 对象头
+        ↓
+3. 解析 header 结构
+   ├─ 签名、版本、标志
+   ├─ 引用计数
+   └─ 消息列表
+        ↓
+4. 遍历消息并调用 message.Parse()     解析每条消息
+   ├─ TypeDataspace → parseDataspace
+   ├─ TypeDatatype → parseDatatype
+   ├─ TypeDataLayout → parseDataLayout
+   ├─ TypeAttribute → parseAttribute
+   └─ TypeLink → parseLink
+        ↓
+5. 返回 Header 结构
+```
+
+### 数据集读取阶段
+
+```
+1. OpenDataset(path)                  解析路径并定位数据集
+        ↓
+2. object.Read(reader, address)       读取数据集对象头
+        ↓
+3. header.Dataspace()                 获取维度信息
+        ↓
+4. header.Datatype()                  获取数据类型
+        ↓
+5. header.DataLayout()                获取存储布局
+        ↓
+6. 根据布局读取数据
+   ├─ 连续布局: 直接读取数据
+   ├─ 分块布局: 读取 B-tree/索引 → 读取块数据 → 解压缩
+   └─ 紧凑布局: 数据存储在 header 中
+        ↓
+7. dtype.Decode(datatype, rawData)    解码为 Go 类型
+        ↓
+8. 返回数据
+```
+
+### 组读取阶段
+
+```
+1. OpenGroup(path)                    解析路径并定位组
+        ↓
+2. object.Read(reader, address)       读取组对象头
+        ↓
+3. 获取 Link 消息                      获取成员链接
+        ↓
+4. 通过 B-tree 或链接消息遍历成员
+   ├─ V1 组: 使用符号表和 B-tree v1
+   └─ V2 组: 使用对象头中的链接消息和 B-tree v2
+        ↓
+5. 返回成员列表
+```
+
+### 属性读取阶段
+
+```
+1. obj.Attr(name)                     在对象头中查找属性
+        ↓
+2. 解析属性消息
+   ├─ 名称
+   ├─ 数据类型
+   ├─ 数据空间
+   └─ 属性数据
+        ↓
+3. 根据数据类型解码值
+        ↓
+4. 返回 Attribute 对象
+```
 
 ## 测试
 
