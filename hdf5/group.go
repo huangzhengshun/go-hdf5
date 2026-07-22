@@ -18,7 +18,8 @@ type Group struct {
 	addr   uint64 // Object header address (for write support)
 
 	// Write support fields
-	pendingLinks []*message.Link // Links to be written
+	pendingLinks     []*message.Link        // Links to be written
+	pendingAttributes []*message.Attribute  // Attributes to be written
 }
 
 // ObjectType indicates the type of an HDF5 object.

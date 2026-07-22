@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/huangzhengshun/go-hdf5/internal/alloc"
 	"github.com/huangzhengshun/go-hdf5/internal/binary"
@@ -22,9 +23,11 @@ type File struct {
 	externalFiles map[string]*File // Cache of opened external files
 
 	// Write support fields
-	writable  bool
-	writer    *binary.Writer
-	allocator *alloc.Allocator // Space allocator for writing
+	writable   bool
+	writer     *binary.Writer
+	allocator  *alloc.Allocator  // Space allocator for writing
+	groupCache map[string]*Group // Cache of created groups for parent lookup
+	mu         sync.RWMutex      // Protects groupCache and other shared state
 }
 
 // Open opens an HDF5 file for reading.
@@ -124,11 +127,21 @@ func (f *File) openGroupAt(address uint64, path string) (*Group, error) {
 		return nil, fmt.Errorf("reading object header: %w", err)
 	}
 
-	return &Group{
+	group := &Group{
 		file:   f,
 		path:   path,
 		header: header,
-	}, nil
+		addr:   address,
+	}
+
+	// Add to group cache for parent lookup
+	f.mu.Lock()
+	if f.groupCache != nil {
+		f.groupCache[path] = group
+	}
+	f.mu.Unlock()
+
+	return group, nil
 }
 
 // openDatasetAt opens a dataset at the given address.

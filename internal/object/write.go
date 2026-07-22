@@ -126,7 +126,7 @@ func WriteHeaderWithMinChunk(w *binary.Writer, messages []message.Message, minCh
 	}
 
 	// Write the complete buffer to the actual writer
-	if err := w.WriteBytes(buf[:bw.Pos()]); err != nil {
+	if err := w.WriteBytes(bufWriter.buf[:bw.Pos()]); err != nil {
 		return 0, err
 	}
 

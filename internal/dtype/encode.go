@@ -30,6 +30,8 @@ func Encode(dt *message.Datatype, src interface{}) ([]byte, error) {
 		return encodeFloatPoint(dt, srcVal)
 	case message.ClassString:
 		return encodeString(dt, srcVal)
+	case message.ClassVarLen:
+		return encodeVarLen(dt, srcVal)
 	default:
 		return nil, fmt.Errorf("unsupported datatype class for encoding: %d", dt.Class)
 	}
@@ -193,6 +195,36 @@ func encodeString(dt *message.Datatype, srcVal reflect.Value) ([]byte, error) {
 	return data, nil
 }
 
+// encodeVarLen encodes variable-length strings.
+// For variable-length strings, we return the actual string bytes directly.
+// The hvl_t structure (offset + length) is handled at a higher level when writing.
+func encodeVarLen(dt *message.Datatype, srcVal reflect.Value) ([]byte, error) {
+	var n int
+	switch srcVal.Kind() {
+	case reflect.Slice, reflect.Array:
+		n = srcVal.Len()
+	default:
+		n = 1
+		sliceVal := reflect.MakeSlice(reflect.SliceOf(srcVal.Type()), 1, 1)
+		sliceVal.Index(0).Set(srcVal)
+		srcVal = sliceVal
+	}
+
+	var data []byte
+	for i := 0; i < n; i++ {
+		elem := srcVal.Index(i)
+		if elem.Kind() == reflect.String {
+			str := elem.String()
+			data = append(data, []byte(str)...)
+			data = append(data, 0)
+		} else {
+			return nil, fmt.Errorf("cannot encode %v as varlen string", elem.Kind())
+		}
+	}
+
+	return data, nil
+}
+
 // GoTypeToDatatype creates an HDF5 datatype from a Go type.
 func GoTypeToDatatype(t reflect.Type) (*message.Datatype, error) {
 	// Handle pointer types
@@ -227,7 +259,7 @@ func GoTypeToDatatype(t reflect.Type) (*message.Datatype, error) {
 	case reflect.Float64:
 		return message.NewFloatDatatype(8, message.OrderLE), nil
 	case reflect.String:
-		// Default to variable-length string
+		// Use variable-length string (default in h5py)
 		return message.NewVarLenStringDatatype(message.CharsetUTF8), nil
 	default:
 		return nil, fmt.Errorf("unsupported Go type: %v", t)

@@ -24,7 +24,9 @@ func (g *Group) CreateDataset(name string, data interface{}, opts ...DatasetOpti
 
 	options := defaultDatasetOptions()
 	for _, opt := range opts {
-		opt(options)
+		if opt != nil {
+			opt(options)
+		}
 	}
 
 	// Get the data value and type
@@ -178,7 +180,9 @@ func (g *Group) CreateDatasetWithType(name string, dims []uint64, dt *message.Da
 
 	options := defaultDatasetOptions()
 	for _, opt := range opts {
-		opt(options)
+		if opt != nil {
+			opt(options)
+		}
 	}
 
 	// Create dataspace

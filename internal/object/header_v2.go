@@ -112,9 +112,26 @@ func readV2(r *binary.Reader, address uint64) (*Header, error) {
 		}
 	}
 
-	// Skip to checksum and verify
-	// For now, we skip checksum verification in v2 message reading
-	// (it's validated at a higher level if needed)
+	// Verify checksum
+	// Checksum covers: signature(4) + version(1) + flags(1) + chunkSize(var) + messages + padding
+	// Total bytes before checksum = 6 + sizeFieldSize + chunk0Size
+	checksumReader := r.At(int64(address))
+	checksumData, err := checksumReader.ReadBytes(6 + int(sizeFieldSize) + int(chunk0Size))
+	if err != nil {
+		return hdr, err
+	}
+
+	// Read stored checksum
+	r.Skip(int64(chunk0Size) - (r.Pos() - (int64(address) + 6 + int64(sizeFieldSize))))
+	storedChecksum, err := r.ReadUint32()
+	if err != nil {
+		return hdr, err
+	}
+
+	calculatedChecksum := binary.Lookup3Checksum(checksumData)
+	if storedChecksum != calculatedChecksum {
+		return nil, ErrChecksumMismatch
+	}
 
 	return hdr, nil
 }

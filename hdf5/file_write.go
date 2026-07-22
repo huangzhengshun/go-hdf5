@@ -80,6 +80,7 @@ func Create(path string, opts ...FileOption) (*File, error) {
 		writable:   true,
 		writer:     writer,
 		allocator:  allocator,
+		groupCache: make(map[string]*Group),
 	}
 
 	// Create root group
@@ -89,6 +90,11 @@ func Create(path string, opts ...FileOption) (*File, error) {
 		header: nil, // Will be loaded on demand
 		addr:   rootGroupAddr,
 	}
+
+	// Add root group to cache
+	f.mu.Lock()
+	f.groupCache["/"] = f.root
+	f.mu.Unlock()
 
 	return f, nil
 }
@@ -171,6 +177,7 @@ func OpenReadWrite(path string) (*File, error) {
 		writable:   true,
 		writer:     writer,
 		allocator:  allocator,
+		groupCache: make(map[string]*Group),
 	}
 
 	// Load root group
@@ -180,6 +187,11 @@ func OpenReadWrite(path string) (*File, error) {
 		return nil, err
 	}
 	f.root = root
+
+	// Add root group to cache
+	f.mu.Lock()
+	f.groupCache["/"] = root
+	f.mu.Unlock()
 
 	return f, nil
 }
