@@ -174,7 +174,24 @@ func convertFixedPoint(dt *message.Datatype, data []byte, n uint64, dest reflect
 		}
 
 		if dest.Kind() == reflect.Slice {
-			dest.Index(int(i)).Set(reflect.ValueOf(val).Convert(dest.Type().Elem()))
+			elemType := dest.Type().Elem()
+			if elemType.Kind() == reflect.Bool {
+				if uintVal, ok := val.(uint8); ok {
+					dest.Index(int(i)).SetBool(uintVal != 0)
+				} else {
+					dest.Index(int(i)).SetBool(val != nil)
+				}
+			} else {
+				dest.Index(int(i)).Set(reflect.ValueOf(val).Convert(elemType))
+			}
+		} else if dest.Kind() == reflect.Bool {
+			if uintVal, ok := val.(uint8); ok {
+				dest.SetBool(uintVal != 0)
+			} else {
+				dest.SetBool(val != nil)
+			}
+		} else if i == 0 {
+			dest.Set(reflect.ValueOf(val).Convert(dest.Type()))
 		}
 	}
 
@@ -219,6 +236,8 @@ func convertFloatPoint(dt *message.Datatype, data []byte, n uint64, dest reflect
 
 		if dest.Kind() == reflect.Slice {
 			dest.Index(int(i)).Set(reflect.ValueOf(val).Convert(dest.Type().Elem()))
+		} else if i == 0 {
+			dest.Set(reflect.ValueOf(val).Convert(dest.Type()))
 		}
 	}
 
