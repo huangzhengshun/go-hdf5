@@ -17,12 +17,11 @@ func WriteHeader(w *binary.Writer, messages []message.Message) (int64, error) {
 }
 
 // WriteHeaderWithMinChunk writes a V2 object header with a minimum chunk size.
-// Note: In HDF5, the chunk size field contains the size of messages only (NOT including
-// the 4-byte checksum). The checksum is written immediately after the messages.
+// Note: In HDF5, the chunk size field contains only the size of messages + padding (NOT checksum).
 func WriteHeaderWithMinChunk(w *binary.Writer, messages []message.Message, minChunkSize int) (int64, error) {
 	startPos := w.Pos()
 
-	// Calculate total message data size
+	// First pass: calculate an estimate for the buffer size
 	var messagesSize int
 	for _, msg := range messages {
 		messagesSize += messageHeaderSize(w, msg)
@@ -31,31 +30,49 @@ func WriteHeaderWithMinChunk(w *binary.Writer, messages []message.Message, minCh
 		}
 	}
 
-	// Chunk size = messages only (checksum is written separately after)
+	// Chunk size = messages + padding (NOT including checksum, per HDF5 spec)
+	// minChunkSize is the minimum size for messages + padding
 	chunkSize := messagesSize
-
-	// Apply minimum chunk size (for compatibility with h5py)
 	if minChunkSize > 0 && chunkSize < minChunkSize {
 		chunkSize = minChunkSize
 	}
 
-	// Calculate padding needed (NIL message)
-	// ChunkSize = messages + padding (checksum is separate)
 	paddingSize := chunkSize - messagesSize
 	if paddingSize < 0 {
 		paddingSize = 0
 	}
 
-	// Determine chunk size field size
-	chunkSizeFieldSize := chunkSizeFieldBytes(int64(chunkSize))
-	flags := uint8(chunkSizeFieldSize - 1)
+	// NIL message has a minimum size of 4 bytes (type + size + flags).
+	// If padding is 1-3 bytes, we need to increase it to 4 to fit a NIL message.
+	if paddingSize > 0 && paddingSize < 4 {
+		paddingSize = 4
+		chunkSize = messagesSize + paddingSize
+	}
 
-	// Calculate total header size for buffering
+	// Determine chunk size field size and flags
+	// HDF5 flag bits 0-1 encode: 0→1 byte, 1→2 bytes, 2→4 bytes, 3→8 bytes
+	var chunkSizeFieldSize int
+	var flags uint8
+	if chunkSize <= 0xFF {
+		chunkSizeFieldSize = 1
+		flags = 0
+	} else if chunkSize <= 0xFFFF {
+		chunkSizeFieldSize = 2
+		flags = 1
+	} else if chunkSize <= 0xFFFFFFFF {
+		chunkSizeFieldSize = 4
+		flags = 2
+	} else {
+		chunkSizeFieldSize = 8
+		flags = 3
+	}
+
+	// Calculate estimated total header size for buffering
 	// signature(4) + version(1) + flags(1) + chunkSize(var) + messages + padding + checksum(4)
-	headerSize := 4 + 1 + 1 + chunkSizeFieldSize + messagesSize + paddingSize + 4
+	estimatedHeaderSize := 4 + 1 + 1 + chunkSizeFieldSize + messagesSize + paddingSize + 4
 
-	// Create buffer for header data
-	buf := make([]byte, headerSize)
+	// Create a buffer larger than estimated to accommodate any differences
+	buf := make([]byte, estimatedHeaderSize+1024)
 	bufWriter := &bufferWriterAt{buf: buf}
 	bw := binary.NewWriter(bufWriter, binary.Config{
 		ByteOrder:  w.ByteOrder(),
@@ -116,8 +133,11 @@ func WriteHeaderWithMinChunk(w *binary.Writer, messages []message.Message, minCh
 		}
 	}
 
-	// Calculate checksum (over entire header except the checksum itself)
-	checksumData := buf[:bw.Pos()]
+	// Calculate checksum: covers everything from OHDR to just before the checksum
+	// This is: signature(4) + version(1) + flags(1) + chunkSize(var) + messages + padding
+	// = 6 + chunkSizeFieldSize + chunkSize
+	checksumDataSize := 6 + chunkSizeFieldSize + chunkSize
+	checksumData := bufWriter.buf[:checksumDataSize]
 	checksum := binary.Lookup3Checksum(checksumData)
 
 	// Write checksum
@@ -125,8 +145,11 @@ func WriteHeaderWithMinChunk(w *binary.Writer, messages []message.Message, minCh
 		return 0, err
 	}
 
+	// Get actual size written
+	actualHeaderSize := bw.Pos()
+
 	// Write the complete buffer to the actual writer
-	if err := w.WriteBytes(bufWriter.buf[:bw.Pos()]); err != nil {
+	if err := w.WriteBytes(bufWriter.buf[:actualHeaderSize]); err != nil {
 		return 0, err
 	}
 
@@ -191,6 +214,7 @@ func messageHeaderSize(w *binary.Writer, msg message.Message) int {
 }
 
 // chunkSizeFieldBytes returns the number of bytes needed to store the chunk size.
+// HDF5 flag bits 0-1 encode: 0→1 byte, 1→2 bytes, 2→4 bytes, 3→8 bytes
 func chunkSizeFieldBytes(size int64) int {
 	if size <= 0xFF {
 		return 1
@@ -220,6 +244,27 @@ func (b *bufferWriterAt) WriteAt(p []byte, off int64) (n int, err error) {
 	return len(p), nil
 }
 
+// SerializeHeader serializes a V2 object header to a byte slice.
+// This is useful for buffering headers in memory before writing to disk.
+func SerializeHeader(w *binary.Writer, messages []message.Message, minChunkSize int) ([]byte, error) {
+	buf := make([]byte, 1024*1024)
+	bufWriter := &bufferWriterAt{buf: buf}
+	bw := binary.NewWriter(bufWriter, binary.Config{
+		ByteOrder:  w.ByteOrder(),
+		OffsetSize: w.OffsetSize(),
+		LengthSize: w.LengthSize(),
+	})
+
+	if _, err := WriteHeaderWithMinChunk(bw, messages, minChunkSize); err != nil {
+		return nil, err
+	}
+
+	actualSize := bw.Pos()
+	result := make([]byte, actualSize)
+	copy(result, bufWriter.buf[:actualSize])
+	return result, nil
+}
+
 // HeaderSize calculates the total size of a V2 object header with the given messages.
 func HeaderSize(w *binary.Writer, messages []message.Message) int {
 	return HeaderSizeWithMinChunk(w, messages, 0)
@@ -236,22 +281,37 @@ func HeaderSizeWithMinChunk(w *binary.Writer, messages []message.Message, minChu
 		}
 	}
 
-	// Chunk size = messages only (checksum is separate)
+	// Chunk size = messages + padding (NOT including checksum, per HDF5 spec)
 	chunkSize := messagesSize
 	if minChunkSize > 0 && chunkSize < minChunkSize {
 		chunkSize = minChunkSize
 	}
 
-	// Calculate padding (NIL message to reach minChunkSize)
 	paddingSize := chunkSize - messagesSize
 	if paddingSize < 0 {
 		paddingSize = 0
 	}
 
-	chunkSizeFieldSize := chunkSizeFieldBytes(int64(chunkSize))
+	// NIL message has a minimum size of 4 bytes (type + size + flags).
+	if paddingSize > 0 && paddingSize < 4 {
+		paddingSize = 4
+		chunkSize = messagesSize + paddingSize
+	}
 
-	// signature(4) + version(1) + flags(1) + chunkSize(var) + messages + padding + checksum(4)
-	return 4 + 1 + 1 + chunkSizeFieldSize + messagesSize + paddingSize + 4
+	// Determine chunk size field size
+	var chunkSizeFieldSize int
+	if chunkSize <= 0xFF {
+		chunkSizeFieldSize = 1
+	} else if chunkSize <= 0xFFFF {
+		chunkSizeFieldSize = 2
+	} else if chunkSize <= 0xFFFFFFFF {
+		chunkSizeFieldSize = 4
+	} else {
+		chunkSizeFieldSize = 8
+	}
+
+	// signature(4) + version(1) + flags(1) + chunkSize(var) + chunk(messages + padding) + checksum(4)
+	return 4 + 1 + 1 + chunkSizeFieldSize + chunkSize + 4
 }
 
 // NewEmptyGroupHeader creates messages for an empty group object header.

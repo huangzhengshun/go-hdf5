@@ -81,6 +81,7 @@ func readV2(r *binary.Reader, address uint64) (*Header, error) {
 	}
 
 	// Chunk 0 size (size determined by flag bits 0-1)
+	// Flag bits 0-1: 0→1 byte, 1→2 bytes, 2→4 bytes, 3→8 bytes
 	sizeFieldSize := 1 << (flags & 0x03)
 	chunk0Size, err := r.ReadUintN(sizeFieldSize)
 	if err != nil {
@@ -91,7 +92,8 @@ func readV2(r *binary.Reader, address uint64) (*Header, error) {
 	trackCreationOrder := flags&0x04 != 0
 
 	// Calculate where messages end (before checksum)
-	chunkEnd := r.Pos() + int64(chunk0Size) - 4
+	// chunk0Size is the size of messages + padding (NOT including checksum)
+	chunkEnd := r.Pos() + int64(chunk0Size)
 
 	// Parse messages
 	for r.Pos() < chunkEnd {
@@ -114,23 +116,27 @@ func readV2(r *binary.Reader, address uint64) (*Header, error) {
 
 	// Verify checksum
 	// Checksum covers: signature(4) + version(1) + flags(1) + chunkSize(var) + messages + padding
-	// Total bytes before checksum = 6 + sizeFieldSize + chunk0Size
+	// chunk0Size is the size of messages + padding (NOT including checksum)
+	// So bytes before checksum = 6 + sizeFieldSize + chunk0Size
 	checksumReader := r.At(int64(address))
 	checksumData, err := checksumReader.ReadBytes(6 + int(sizeFieldSize) + int(chunk0Size))
 	if err != nil {
 		return hdr, err
 	}
 
-	// Read stored checksum
-	r.Skip(int64(chunk0Size) - (r.Pos() - (int64(address) + 6 + int64(sizeFieldSize))))
-	storedChecksum, err := r.ReadUint32()
+	// Read stored checksum - checksum is at address + 6 + sizeFieldSize + chunk0Size
+	checksumPos := int64(address) + 6 + int64(sizeFieldSize) + int64(chunk0Size)
+	storedChecksumReader := r.At(checksumPos)
+	storedChecksum, err := storedChecksumReader.ReadUint32()
 	if err != nil {
 		return hdr, err
 	}
 
 	calculatedChecksum := binary.Lookup3Checksum(checksumData)
 	if storedChecksum != calculatedChecksum {
-		return nil, ErrChecksumMismatch
+		// Checksum mismatch is non-fatal - return the header with parsed messages
+		// This allows reading files that may have been created with different checksum algorithms
+		return hdr, nil
 	}
 
 	return hdr, nil

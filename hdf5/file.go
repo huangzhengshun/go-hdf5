@@ -30,11 +30,15 @@ type File struct {
 	mu         sync.RWMutex      // Protects groupCache and other shared state
 }
 
-// Open opens an HDF5 file for reading.
+// Open opens an HDF5 file for reading and writing.
+// If the file cannot be opened in read-write mode, it falls back to read-only mode.
 func Open(path string) (*File, error) {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("opening file: %w", err)
+		f, err = os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("opening file: %w", err)
+		}
 	}
 
 	// Parse superblock
@@ -52,6 +56,17 @@ func Open(path string) (*File, error) {
 		file:       f,
 		reader:     reader,
 		superblock: sb,
+		writable:   false,
+		groupCache: make(map[string]*Group),
+	}
+
+	// Check if file is writable
+	if fileInfo, err := f.Stat(); err == nil {
+		if fileInfo.Mode().Perm()&0200 != 0 {
+			hdf.writable = true
+			hdf.writer = binary.NewWriter(f, sb.ReaderConfig())
+			hdf.allocator = alloc.New(sb.EOFAddress)
+		}
 	}
 
 	// Load root group
@@ -122,16 +137,28 @@ func (f *File) OpenDataset(path string) (*Dataset, error) {
 
 // openGroupAt opens a group at the given address.
 func (f *File) openGroupAt(address uint64, path string) (*Group, error) {
+	// Check cache first - if a group with pending changes exists, return it
+	f.mu.RLock()
+	if f.groupCache != nil {
+		if cached, ok := f.groupCache[path]; ok {
+			f.mu.RUnlock()
+			return cached, nil
+		}
+	}
+	f.mu.RUnlock()
+
 	header, err := object.Read(f.reader, address)
 	if err != nil {
 		return nil, fmt.Errorf("reading object header: %w", err)
 	}
 
 	group := &Group{
-		file:   f,
-		path:   path,
-		header: header,
-		addr:   address,
+		file:              f,
+		path:              path,
+		header:            header,
+		addr:              address,
+		pendingLinks:      nil,
+		pendingAttributes: nil,
 	}
 
 	// Add to group cache for parent lookup

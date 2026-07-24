@@ -18,8 +18,8 @@ type Group struct {
 	addr   uint64 // Object header address (for write support)
 
 	// Write support fields
-	pendingLinks     []*message.Link        // Links to be written
-	pendingAttributes []*message.Attribute  // Attributes to be written
+	pendingLinks      []*message.Link      // Links to be written
+	pendingAttributes []*message.Attribute // Attributes to be written
 }
 
 // ObjectType indicates the type of an HDF5 object.
@@ -145,6 +145,27 @@ func (g *Group) findChild(name string) (uint64, bool, error) {
 
 // findChildFull finds a child and returns full resolution info including external file.
 func (g *Group) findChildFull(name string, visited map[string]bool) (*linkResolution, error) {
+	// First check pending links (not yet flushed to disk)
+	if g.pendingLinks != nil {
+		for _, link := range g.pendingLinks {
+			if link.Name == name {
+				return g.resolveLink(link, visited)
+			}
+		}
+	}
+
+	if g.header == nil {
+		if g.file.reader != nil {
+			header, err := object.Read(g.file.reader, g.addr)
+			if err != nil {
+				return nil, err
+			}
+			g.header = header
+		} else {
+			return nil, ErrNotFound
+		}
+	}
+
 	// Try to find via Link messages (v2 groups)
 	for _, msg := range g.header.GetMessages(message.TypeLink) {
 		link := msg.(*message.Link)
@@ -472,6 +493,9 @@ func (g *Group) Attrs() []string {
 
 // Attr returns an attribute by name, or nil if not found.
 func (g *Group) Attr(name string) *Attribute {
+	if g.header == nil {
+		return nil
+	}
 	for _, msg := range g.header.GetMessages(message.TypeAttribute) {
 		attr := msg.(*message.Attribute)
 		if attr.Name == name {

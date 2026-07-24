@@ -34,13 +34,13 @@ func (g *Group) CreateGroup(name string) (*Group, error) {
 	// Create an empty group object header
 	groupMessages := object.NewEmptyGroupHeader()
 
-	// Calculate header size and allocate space
-	headerSize := object.HeaderSize(g.file.writer, groupMessages)
+	// Calculate header size with minimum chunk size for h5py compatibility
+	headerSize := object.HeaderSizeWithMinChunk(g.file.writer, groupMessages, object.MinGroupChunkSize)
 	groupAddr := g.file.allocate(int64(headerSize))
 
 	// Write the group object header
 	w := g.file.writer.At(int64(groupAddr))
-	if _, err := object.WriteHeader(w, groupMessages); err != nil {
+	if _, err := object.WriteHeaderWithMinChunk(w, groupMessages, object.MinGroupChunkSize); err != nil {
 		return nil, fmt.Errorf("writing group header: %w", err)
 	}
 
@@ -54,11 +54,12 @@ func (g *Group) CreateGroup(name string) (*Group, error) {
 
 	// Create the Group object
 	newGroup := &Group{
-		file:         g.file,
-		path:         newPath,
-		header:       nil, // Will be loaded on demand if needed
-		addr:         groupAddr,
-		pendingLinks: nil,
+		file:              g.file,
+		path:              newPath,
+		header:            nil, // Will be loaded on demand if needed
+		addr:              groupAddr,
+		pendingLinks:      nil,
+		pendingAttributes: nil,
 	}
 
 	// Add to group cache for parent lookup
@@ -171,9 +172,15 @@ func (g *Group) CreateAttribute(name string, value interface{}) error {
 		return err
 	}
 
+	if g.pendingAttributes == nil {
+		if err := g.loadExistingAttributes(); err != nil {
+			return fmt.Errorf("loading existing attributes: %w", err)
+		}
+	}
+
 	g.pendingAttributes = append(g.pendingAttributes, attr)
 
-	return g.rewriteHeader()
+	return nil
 }
 
 // addLink adds a link message to this group.
@@ -192,8 +199,33 @@ func (g *Group) addLink(link *message.Link) error {
 
 	g.pendingLinks = append(g.pendingLinks, link)
 
-	// Rewrite the group's object header with the new link
-	return g.rewriteHeader()
+	// Don't rewrite header immediately - let Flush handle all rewrites
+	return nil
+}
+
+// loadExistingAttributes loads existing attribute messages from the group's object header.
+func (g *Group) loadExistingAttributes() error {
+	g.pendingAttributes = make([]*message.Attribute, 0)
+
+	if g.header == nil && g.file.reader != nil {
+		header, err := object.Read(g.file.reader, g.addr)
+		if err != nil {
+			return err
+		}
+		g.header = header
+	}
+
+	if g.header == nil {
+		return nil
+	}
+
+	for _, msg := range g.header.GetMessages(message.TypeAttribute) {
+		if attrMsg, ok := msg.(*message.Attribute); ok {
+			g.pendingAttributes = append(g.pendingAttributes, attrMsg)
+		}
+	}
+
+	return nil
 }
 
 // loadExistingLinks loads existing link messages from the group's object header.
@@ -205,7 +237,7 @@ func (g *Group) loadExistingLinks() error {
 	if g.header == nil && g.file.reader != nil {
 		header, err := object.Read(g.file.reader, g.addr)
 		if err != nil {
-			return nil
+			return err
 		}
 		g.header = header
 	}
@@ -285,20 +317,72 @@ func (g *Group) rewriteHeader() error {
 	}
 
 	// Update our address
-	oldAddr := g.addr
 	g.addr = newAddr
 
 	// If this is the root group, update the superblock
 	if g.path == "/" {
 		g.file.superblock.RootGroupAddress = newAddr
-	} else {
-		// Update parent's link to point to new address
-		if err := g.updateParentLink(oldAddr, newAddr); err != nil {
+	}
+
+	return nil
+}
+
+// updateParentLinkImmediate updates the parent group's link immediately.
+func (g *Group) updateParentLinkImmediate(oldAddr, newAddr uint64) error {
+	parent := g.findParent()
+	if parent == nil {
+		return nil
+	}
+
+	if parent.pendingLinks == nil {
+		if err := parent.loadExistingLinks(); err != nil {
 			return err
 		}
 	}
 
-	return nil
+	found := false
+	for _, link := range parent.pendingLinks {
+		if link.Name == path.Base(g.path) {
+			link.ObjectAddress = newAddr
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		link := message.NewHardLink(path.Base(g.path), newAddr)
+		parent.pendingLinks = append(parent.pendingLinks, link)
+	}
+
+	return parent.rewriteHeader()
+}
+
+// recordParentLinkUpdate records that the parent's link needs to be updated.
+func (g *Group) recordParentLinkUpdate(oldAddr, newAddr uint64) {
+	parent := g.findParent()
+	if parent == nil {
+		return
+	}
+
+	if parent.pendingLinks == nil {
+		parent.loadExistingLinks()
+	}
+
+	found := false
+	for _, link := range parent.pendingLinks {
+		if link.Name == path.Base(g.path) {
+			link.ObjectAddress = newAddr
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		link := message.NewHardLink(path.Base(g.path), newAddr)
+		parent.pendingLinks = append(parent.pendingLinks, link)
+	}
+
+	parent.header = nil
 }
 
 // updateParentLink updates the parent group's link to point to the new address.
@@ -341,8 +425,11 @@ func (g *Group) updateParentLink(oldAddr, newAddr uint64) error {
 		parent.pendingLinks = append(parent.pendingLinks, link)
 	}
 
-	// Rewrite parent's header
-	return parent.rewriteHeader()
+	parent.header = nil
+	if parent.pendingLinks == nil {
+		parent.pendingLinks = make([]*message.Link, 0)
+	}
+	return nil
 }
 
 // findParent finds the parent group in the file's group hierarchy.
