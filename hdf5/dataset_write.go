@@ -42,25 +42,29 @@ func (g *Group) CreateDataset(name string, data interface{}, opts ...DatasetOpti
 	}
 
 	// Create datatype from Go type
-	datatype, err := dtype.GoTypeToDatatype(elemType)
-	if err != nil {
-		return nil, fmt.Errorf("creating datatype: %w", err)
+	var datatype *message.Datatype
+	var rawData []byte
+
+	if elemType.Kind() == reflect.String {
+		datatype, rawData, err = createFixedLengthStringDataset(dataVal, dims)
+		if err != nil {
+			return nil, fmt.Errorf("creating string dataset: %w", err)
+		}
+	} else {
+		datatype, err = dtype.GoTypeToDatatype(elemType)
+		if err != nil {
+			return nil, fmt.Errorf("creating datatype: %w", err)
+		}
+
+		// Encode the data
+		rawData, err = dtype.Encode(datatype, data)
+		if err != nil {
+			return nil, fmt.Errorf("encoding data: %w", err)
+		}
 	}
 
 	// Create dataspace
 	dataspace := message.NewDataspace(dims, options.maxDims)
-
-	// Calculate total number of elements
-	numElements := uint64(1)
-	for _, d := range dims {
-		numElements *= d
-	}
-
-	// Encode the data
-	rawData, err := dtype.Encode(datatype, data)
-	if err != nil {
-		return nil, fmt.Errorf("encoding data: %w", err)
-	}
 
 	// Determine layout
 	var dataLayout *message.DataLayout
@@ -412,4 +416,49 @@ func createStringArrayAttribute(name string, val reflect.Value) (*message.Attrib
 	}
 
 	return message.NewAttribute(name, datatype, dataspace, data), nil
+}
+
+// createFixedLengthStringDataset creates a fixed-length string dataset.
+// Fixed-length strings can be stored directly without global heap support.
+func createFixedLengthStringDataset(dataVal reflect.Value, dims []uint64) (*message.Datatype, []byte, error) {
+	var strs []string
+
+	switch dataVal.Kind() {
+	case reflect.Slice, reflect.Array:
+		n := dataVal.Len()
+		strs = make([]string, n)
+		for i := 0; i < n; i++ {
+			strs[i] = dataVal.Index(i).String()
+		}
+	case reflect.String:
+		strs = []string{dataVal.String()}
+	default:
+		return nil, nil, fmt.Errorf("expected string or []string")
+	}
+
+	maxLen := 0
+	for _, s := range strs {
+		if len(s) > maxLen {
+			maxLen = len(s)
+		}
+	}
+
+	strLen := maxLen + 1
+
+	datatype := message.NewStringDatatype(uint32(strLen), message.PadNullTerm, message.CharsetASCII)
+
+	numElements := uint64(1)
+	for _, d := range dims {
+		numElements *= d
+	}
+	totalSize := int(numElements) * strLen
+
+	data := make([]byte, totalSize)
+	for i, s := range strs {
+		offset := i * strLen
+		copy(data[offset:], s)
+		data[offset+len(s)] = 0
+	}
+
+	return datatype, data, nil
 }

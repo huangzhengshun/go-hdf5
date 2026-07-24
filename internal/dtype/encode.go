@@ -89,6 +89,12 @@ func encodeFixedPoint(dt *message.Datatype, srcVal reflect.Value) ([]byte, error
 			order.PutUint32(data[offset:], uint32(elem.Uint()))
 		case reflect.Uint64, reflect.Uint:
 			order.PutUint64(data[offset:], elem.Uint())
+		case reflect.Bool:
+			if elem.Bool() {
+				data[offset] = 1
+			} else {
+				data[offset] = 0
+			}
 		default:
 			return nil, fmt.Errorf("cannot encode %v as fixed-point", elem.Kind())
 		}
@@ -258,6 +264,8 @@ func GoTypeToDatatype(t reflect.Type) (*message.Datatype, error) {
 		return message.NewFloatDatatype(4, message.OrderLE), nil
 	case reflect.Float64:
 		return message.NewFloatDatatype(8, message.OrderLE), nil
+	case reflect.Bool:
+		return message.NewFixedPointDatatype(1, false, message.OrderLE), nil
 	case reflect.String:
 		// Use variable-length string (default in h5py)
 		return message.NewVarLenStringDatatype(message.CharsetUTF8), nil
